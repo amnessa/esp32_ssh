@@ -34,6 +34,13 @@ const char *configSTAPSK = "K0van1231";
 // Stack size needed to run SSH.
 const unsigned int configSTACK = 10240;
 
+// Include Arduino core first for basic definitions
+#include <Arduino.h>
+
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2 // Default LED pin for ESP32
+#endif
+
 // Include Arduino WiFi first
 #include "WiFi.h"
 #if ESP_IDF_VERSION_MAJOR <= 4
@@ -369,8 +376,9 @@ int ex_main(int argc, char **argv){
     sshbind=ssh_bind_new();
     session=ssh_new();
 
+    // Explicitly set the ED25519 host key
     ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_HOSTKEY,
-                         KEYS_FOLDER "ssh_host_rsa_key");
+                         "/spiffs/.ssh/id_ed25519");
 
 #ifdef HAVE_ARGP_H // This preprocessor block will now be false
     /*
@@ -463,21 +471,63 @@ int ex_main(int argc, char **argv){
 
 
     printf("it works !\n");
+
+    static char line_buffer[128];
+    static int line_pos = 0;
     do{
-        i=ssh_channel_read(chan,buf, sizeof(buf), 0);
-        if(i>0) {
-            if(*buf == '' || *buf == '')
-                    break;
-            if(i == 1 && *buf == '\r')
-                ssh_channel_write(chan, "\r\n", 2);
-            else
-                ssh_channel_write(chan, buf, i);
-            if (write(1,buf,i) < 0) {
-                printf("error writing to buffer\n");
-                return 1;
+        // Read data from the SSH client AT THE START of each loop iteration
+        i = ssh_channel_read(chan, buf, sizeof(buf), 0);
+
+        // Keep your new command processing logic
+        if (i > 0){
+          for (int j = 0; j < i; ++j) {
+            if (buf[j] == '\r' || buf[j] == '\n') {
+              line_buffer[line_pos] = '\0'; // Null-terminate the string
+
+              // --- Process the command in line_buffer ---
+              printf("Received command: %s\n", line_buffer); // Prints to ESP32 monitor
+              const char *response = "Unknown command\r\n"; // Default response
+
+              if (strcmp(line_buffer, "help") == 0) {
+                  response = "Available commands: help, led_on, led_off\r\n";
+              } else if (strcmp(line_buffer, "led_on") == 0) {
+                  pinMode(LED_BUILTIN, OUTPUT);
+                  digitalWrite(LED_BUILTIN, HIGH);
+                  response = "LED turned ON\r\n";
+              } else if (strcmp(line_buffer, "led_off") == 0) {
+                  pinMode(LED_BUILTIN, OUTPUT);
+                  digitalWrite(LED_BUILTIN, LOW);
+                  response = "LED turned OFF\r\n";
+              } // Add more else if for other commands...
+
+              // Send response back to SSH client
+              ssh_channel_write(chan, response, strlen(response));
+
+              // Send prompt for next command
+              ssh_channel_write(chan, "> ", 2);
+
+              line_pos = 0; // Reset buffer position for next command
+            } else if (line_pos < sizeof(line_buffer) - 1) {
+                // Add character to buffer
+                line_buffer[line_pos++] = buf[j];
+                // Echo character back
+                ssh_channel_write(chan, &buf[j], 1);
             }
+          }
+        } else if (i < 0) { // Handle read errors
+            printf("Error reading channel: %s\n", ssh_get_error(session));
+            break; // Exit loop on error
         }
-    } while (i>0);
+        // Add a small delay to prevent busy-waiting if no data is read
+        // This might be needed depending on how ssh_channel_read behaves (blocking/non-blocking)
+        // if (i == 0) {
+        //    vTaskDelay(10 / portTICK_PERIOD_MS);
+        // }
+
+    } while (i >= 0); // Loop while connection is open and no errors (i=0 means no data, i>0 means data, i<0 means error)
+
+    // Cleanup code follows...
+    ssh_channel_send_eof(chan); // Send End-of-File before closing
     ssh_channel_close(chan);
     ssh_disconnect(session);
     ssh_bind_free(sshbind);
@@ -558,7 +608,7 @@ void controlTask(void *pvParameter)
   {
     printf("%% No formatted SPIFFS filesystem found to mount.\n");
     printf("%% Format SPIFFS and mount now (NB. may cause data loss) [y/n]?\n");
-    while (!Serial.available()) {}
+    while (!Serial.available()) {} // Waits here for input.
     char c = Serial.read();
     if (c == 'y' || c == 'Y')
     {
