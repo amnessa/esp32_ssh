@@ -21,8 +21,8 @@ clients must be made or how a client should react.
 */
 
 // Set local WiFi credentials below.
-const char *configSTASSID = "ROMER_MESH";
-const char *configSTAPSK = "K0van1231";
+const char *configSTASSID = "*****";
+const char *configSTAPSK = "*****";
 
 // The command line you would use to run this from a shell prompt.
 #define EX_CMD "samplesshd-kbdint", "--hostkey", "/spiffs/.ssh/id_ed25519", \
