@@ -6,7 +6,7 @@ const char *configSTASSID = "SUPERONLINE_Wi-Fi_A662";
 const char *configSTAPSK = "FReSBNCQy4";
 
 // The command line you would use to run this from a shell prompt.
-#define EX_CMD "samplesshd-kbdint", "--hostkey", "/spiffs/.ssh/id_ed25519", \
+//#define EX_CMD "samplesshd-kbdint", "--hostkey", "/spiffs/.ssh/id_ed25519", \
                "::"
 
 // SSH key storage location.
@@ -240,7 +240,6 @@ void controlTask(void *pvParameter)
         sshServer.begin();
         while (1) {
             sshServer.handleClient();
-            vTaskDelay(10 / portTICK_PERIOD_MS);
         }
         // Finished the EXAMPLE main code.
         if (!aborting)
