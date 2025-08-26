@@ -1,5 +1,7 @@
 #include "SshServer.h"
 #include <Arduino.h>
+#include <libssh/callbacks.h>
+#include <libssh/server.h>
 
 SshServer::SshServer(const char* host_key) {
     this->host_key = host_key;
@@ -28,25 +30,34 @@ void SshServer::handleClient() {
         return;
     }
 
-    ssh_callbacks_struct cb;
-    memset(&cb, 0, sizeof(cb));
-    ssh_callbacks_init(&cb);
-    cb.auth_password_function = auth_password;
-    ssh_set_callbacks(session, &cb);
-
     if (ssh_handle_key_exchange(session)) {
         return;
     }
 
-    ssh_set_auth_methods(session, SSH_AUTH_METHOD_PASSWORD);
-    ssh_event event;
-    while ((event = ssh_event_poll(NULL, 0)) != NULL) {
-        if (ssh_event_get_type(event) == SSH_EVENT_SESSION_AUTHENTICATE) {
-            if (ssh_event_get_return_code(event) == SSH_AUTH_SUCCESS) {
-                break;
+    ssh_message message;
+    do {
+        message = ssh_message_get(session);
+        if(!message)
+            break;
+        if(ssh_message_type(message) == SSH_REQUEST_AUTH) {
+            if(ssh_message_subtype(message) == SSH_AUTH_METHOD_PASSWORD) {
+                if(auth_password(session,
+                   ssh_message_auth_user(message),
+                   ssh_message_auth_password(message),
+                   NULL) == SSH_AUTH_SUCCESS) {
+                    ssh_message_auth_reply_success(message, 0);
+                    ssh_message_free(message);
+                    break;
+                }
             }
+            ssh_message_auth_set_methods(message, SSH_AUTH_METHOD_PASSWORD);
+            ssh_message_reply_default(message);
+        } else {
+            ssh_message_reply_default(message);
         }
-    }
+        ssh_message_free(message);
+    } while (true);
+
 
     ssh_channel channel = ssh_channel_new(session);
     while (channel == NULL) {
