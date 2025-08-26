@@ -1,28 +1,9 @@
-// ESP32 libssh port.
-//
-// Ewan Parker, created 18th April 2020.
-// Simple port of examples/samplesshd-kbdint.c over WiFi.  Run with a serial
-// monitor at 115200 BAUD.
-//
-// Copyright (C) 2016–2024 Ewan Parker.
-
-/* This is a sample implementation of a libssh based SSH server */
-/*
-Copyright 2003-2011 Aris Adamantiadis
-
-This file is part of the SSH Library
-
-You are free to copy this file, modify it in any way, consider it being public
-domain. This does not apply to the rest of the library though, but it is
-allowed to cut-and-paste working code from this file to any license of
-program.
-The goal is to show the API in action. It's not a reference on how terminal
-clients must be made or how a client should react.
-*/
+#include "wifi_manager/WifiManager.h"
+#include "ssh_server/SshServer.h"
 
 // Set local WiFi credentials below.
-const char *configSTASSID = "*****";
-const char *configSTAPSK = "*****";
+const char *configSTASSID = "YOUR_SSID";
+const char *configSTAPSK = "YOUR_PASSWORD";
 
 // The command line you would use to run this from a shell prompt.
 #define EX_CMD "samplesshd-kbdint", "--hostkey", "/spiffs/.ssh/id_ed25519", \
@@ -41,18 +22,9 @@ const unsigned int configSTACK = 10240;
 #define LED_BUILTIN 2 // Default LED pin for ESP32
 #endif
 
-// Include Arduino WiFi first
-#include "WiFi.h"
-#if ESP_IDF_VERSION_MAJOR <= 4
-#include "IPv6Address.h" // Keep this near WiFi.h if related
-#endif
-
 // Then include lower-level network headers
 #include <arpa/inet.h>
 #include "esp_netif.h"
-
-// Include the Arduino library for libssh
-#include "libssh_esp32.h"
 
 // Use argument parsing.
 // #define HAVE_ARGP_H // Keep this commented out or remove
@@ -123,421 +95,8 @@ static volatile bool gotIpAddr, gotIp6Addr;
 
 #include "SPIFFS.h"
 
-// EXAMPLE functions START
-#ifdef WITH_PCAP
-static const char *pcap_file = "debug.server.pcap";
-static ssh_pcap_file pcap;
-
-static void set_pcap(ssh_session session){
-        if(!pcap_file)
-                return;
-        pcap=ssh_pcap_file_new();
-        if(ssh_pcap_file_open(pcap,pcap_file) == SSH_ERROR){
-                printf("Error opening pcap file\n");
-                ssh_pcap_file_free(pcap);
-                pcap=NULL;
-                return;
-        }
-        ssh_set_pcap_file(session,pcap);
-}
-
-static void cleanup_pcap(void) {
-        ssh_pcap_file_free(pcap);
-        pcap=NULL;
-}
-#endif
-
-
-static int auth_password(const char *user, const char *password)
-{
-    int cmp;
-
-    cmp = strcmp(user, SSHD_USER);
-    if (cmp != 0) {
-        return 0;
-    }
-    cmp = strcmp(password, SSHD_PASSWORD);
-    if (cmp != 0) {
-        return 0;
-    }
-
-    authenticated = true;
-    return 1; // authenticated
-}
-#ifdef HAVE_ARGP_H // This preprocessor block will now be false
-const char *argp_program_version = "libssh server example "
-  SSH_STRINGIFY(LIBSSH_VERSION);
-const char *argp_program_bug_address = "<libssh@libssh.org>";
-
-/* Program documentation. */
-static char doc[] = "libssh -- a Secure Shell protocol implementation";
-
-/* A description of the arguments we accept. */
-static char args_doc[] = "BINDADDR";
-
-/* The options we understand. */
-static struct argp_option options[] = {
-  {
-    .name  = "port",
-    .key   = 'p',
-    .arg   = "PORT",
-    .flags = 0,
-    .doc   = "Set the port to bind.",
-    .group = 0
-  },
-  {
-    .name  = "hostkey",
-    .key   = 'k',
-    .arg   = "FILE",
-    .flags = 0,
-    .doc   = "Set the host key.",
-    .group = 0
-  },
-  {
-    .name  = "rsakey",
-    .key   = 'r',
-    .arg   = "FILE",
-    .flags = 0,
-    .doc   = "Set the rsa key (deprecated alias for 'k').",
-    .group = 0
-  },
-  {
-    .name  = "verbose",
-    .key   = 'v',
-    .arg   = NULL,
-    .flags = 0,
-    .doc   = "Get verbose output.",
-    .group = 0
-  },
-  {NULL, 0, 0, 0, NULL, 0}
-};
-
-/* Parse a single option. */
-static error_t parse_opt (int key, char *arg, struct argp_state *state) {
-  /* Get the input argument from argp_parse, which we
-   * know is a pointer to our arguments structure.
-   */
-  ssh_bind sshbind = (ssh_bind)state->input;
-
-  switch (key) {
-    case 'p':
-      ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_BINDPORT_STR, arg);
-      port = atoi(arg);
-      break;
-    case 'r':
-    case 'k':
-      ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_HOSTKEY, arg);
-      break;
-    case 'v':
-      ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_LOG_VERBOSITY_STR, "3");
-      break;
-    case ARGP_KEY_ARG:
-      if (state->arg_num >= 1) {
-        /* Too many arguments. */
-        argp_usage (state);
-      }
-      ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_BINDADDR, arg);
-      break;
-    case ARGP_KEY_END:
-      if (state->arg_num < 1) {
-        /* Not enough arguments. */
-        argp_usage (state);
-      }
-      break;
-    default:
-      return ARGP_ERR_UNKNOWN;
-  }
-
-  return 0;
-}
-
-/* Our argp parser. */
-static struct argp argp = {options, parse_opt, args_doc, doc, NULL, NULL, NULL};
-#endif /* HAVE_ARGP_H */
-
-static const char *name;
-static const char *instruction;
-static const char *prompts[2];
-static char echo[] = { 1, 0 };
-
-static int kbdint_check_response(ssh_session session) {
-    int count;
-
-    count = ssh_userauth_kbdint_getnanswers(session);
-    if(count != 2) {
-        instruction = "Something weird happened :(";
-        return 0;
-    }
-    if(strcasecmp("Arthur Dent",
-                        ssh_userauth_kbdint_getanswer(session, 0)) != 0) {
-        instruction = "OK, this is not YOUR name, "
-                                        "but it's a reference to the HGTG...";
-        prompts[0] = "The main character's full name: ";
-        return 0;
-    } 
-    if(strcmp("42", ssh_userauth_kbdint_getanswer(session, 1)) != 0) {
-        instruction = "Make an effort !!! What is the Answer to the Ultimate "
-                            "Question of Life, the Universe, and Everything ?";
-        prompts[1] = "Answer to the Ultimate Question of Life, the Universe, "
-                            "and Everything: ";
-        return 0;
-    }
-
-    authenticated = true;
-    return 1;
-}
-
-static int authenticate(ssh_session session) {
-    ssh_message message;
-
-    name = "\n\nKeyboard-Interactive Fancy Authentication\n";
-    instruction = "Please enter your real name and your password";
-    prompts[0] = "Real name: ";
-    prompts[1] = "Password: ";
-
-    do {
-        message=ssh_message_get(session);
-        if(!message)
-            break;
-        switch(ssh_message_type(message)){
-            case SSH_REQUEST_AUTH:
-                switch(ssh_message_subtype(message)){
-                    case SSH_AUTH_METHOD_PASSWORD:
-                        printf("User %s wants to auth with pass %s\n",
-                               ssh_message_auth_user(message),
-                               ssh_message_auth_password(message));
-                        if(auth_password(ssh_message_auth_user(message),
-                           ssh_message_auth_password(message))){
-                               ssh_message_auth_reply_success(message,0);
-                               ssh_message_free(message);
-                               return 1;
-                           }
-                        ssh_message_auth_set_methods(message,
-                                                SSH_AUTH_METHOD_PASSWORD |
-                                                SSH_AUTH_METHOD_INTERACTIVE);
-                        // not authenticated, send default message
-                        ssh_message_reply_default(message);
-                        break;
-
-                    case SSH_AUTH_METHOD_INTERACTIVE:
-                        if(!ssh_message_auth_kbdint_is_response(message)) {
-                            printf("User %s wants to auth with kbdint\n",
-                                   ssh_message_auth_user(message));
-                            ssh_message_auth_interactive_request(message, name,
-                                                    instruction, 2, prompts, echo);
-                        } else {
-                            if(kbdint_check_response(session)) {
-                                ssh_message_auth_reply_success(message,0);
-                                ssh_message_free(message);
-                                return 1;
-                            }
-                            ssh_message_auth_set_methods(message,
-                                                    SSH_AUTH_METHOD_PASSWORD |
-                                                    SSH_AUTH_METHOD_INTERACTIVE);
-                            ssh_message_reply_default(message);
-                        }
-                        break;
-                    case SSH_AUTH_METHOD_NONE:
-                    default:
-                        printf("User %s wants to auth with unknown auth %d\n",
-                               ssh_message_auth_user(message),
-                               ssh_message_subtype(message));
-                        ssh_message_auth_set_methods(message,
-                                                SSH_AUTH_METHOD_PASSWORD |
-                                                SSH_AUTH_METHOD_INTERACTIVE);
-                        ssh_message_reply_default(message);
-                        break;
-                }
-                break;
-            default:
-                ssh_message_auth_set_methods(message,
-                                                SSH_AUTH_METHOD_PASSWORD |
-                                                SSH_AUTH_METHOD_INTERACTIVE);
-                ssh_message_reply_default(message);
-        }
-        ssh_message_free(message);
-    } while (1);
-    return 0;
-}
-// EXAMPLE functions FINISH
-
-// EXAMPLE main START
-int ex_main(int argc, char **argv){
-    ssh_session session;
-    ssh_bind sshbind;
-    ssh_message message;
-    ssh_channel chan=0;
-    char buf[BUF_SIZE];
-    int auth=0;
-    int shell=0;
-    int i;
-    int r;
-
-    sshbind=ssh_bind_new();
-    session=ssh_new();
-
-    // Explicitly set the ED25519 host key
-    ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_HOSTKEY,
-                         "/spiffs/.ssh/id_ed25519");
-
-#ifdef HAVE_ARGP_H // This preprocessor block will now be false
-    /*
-     * Parse our arguments; every option seen by parse_opt will
-     * be reflected in arguments.
-     */
-    argp_parse (&argp, argc, argv, 0, 0, sshbind);
-#else // This block will now be included
-    (void) argc;
-    (void) argv;
-#endif
-#ifdef WITH_PCAP
-    set_pcap(session);
-#endif
-
-    if(ssh_bind_listen(sshbind)<0){
-        printf("Error listening to socket: %s\n", ssh_get_error(sshbind));
-        return 1;
-    }
-    printf("Started sample libssh sshd on port %d\n", port);
-    printf("You can login as the user %s with the password %s\n", SSHD_USER,
-                                                            SSHD_PASSWORD);
-    r = ssh_bind_accept(sshbind, session);
-    if(r==SSH_ERROR){
-      printf("Error accepting a connection: %s\n", ssh_get_error(sshbind));
-      return 1;
-    }
-    if (ssh_handle_key_exchange(session)) {
-        printf("ssh_handle_key_exchange: %s\n", ssh_get_error(session));
-        return 1;
-    }
-
-    /* proceed to authentication */
-    auth = authenticate(session);
-    if (!auth || !authenticated) {
-        printf("Authentication error: %s\n", ssh_get_error(session));
-        ssh_disconnect(session);
-        return 1;
-    }
-
-
-    /* wait for a channel session */
-    do {
-        message = ssh_message_get(session);
-        if(message){
-            if(ssh_message_type(message) == SSH_REQUEST_CHANNEL_OPEN &&
-                    ssh_message_subtype(message) == SSH_CHANNEL_SESSION) {
-                chan = ssh_message_channel_request_open_reply_accept(message);
-                ssh_message_free(message);
-                break;
-            } else {
-                ssh_message_reply_default(message);
-                ssh_message_free(message);
-            }
-        } else {
-            break;
-        }
-    } while(!chan);
-
-    if (!chan) {
-        printf("Error: client did not ask for a channel session (%s)\n",
-               ssh_get_error(session));
-        ssh_finalize();
-        return 1;
-    }
-
-
-    /* wait for a shell */
-    do {
-        message = ssh_message_get(session);
-        if(message != NULL) {
-            if(ssh_message_type(message) == SSH_REQUEST_CHANNEL &&
-                    ssh_message_subtype(message) == SSH_CHANNEL_REQUEST_SHELL) {
-                shell = 1;
-                ssh_message_channel_request_reply_success(message);
-                ssh_message_free(message);
-                break;
-            }
-            ssh_message_reply_default(message);
-            ssh_message_free(message);
-        } else {
-            break;
-        }
-    } while(!shell);
-
-    if(!shell) {
-        printf("Error: No shell requested (%s)\n", ssh_get_error(session));
-        return 1;
-    }
-
-
-    printf("it works !\n");
-
-    static char line_buffer[128];
-    static int line_pos = 0;
-    do{
-        // Read data from the SSH client AT THE START of each loop iteration
-        i = ssh_channel_read(chan, buf, sizeof(buf), 0);
-
-        // Keep your new command processing logic
-        if (i > 0){
-          for (int j = 0; j < i; ++j) {
-            if (buf[j] == '\r' || buf[j] == '\n') {
-              line_buffer[line_pos] = '\0'; // Null-terminate the string
-
-              // --- Process the command in line_buffer ---
-              printf("Received command: %s\n", line_buffer); // Prints to ESP32 monitor
-              const char *response = "Unknown command\r\n"; // Default response
-
-              if (strcmp(line_buffer, "help") == 0) {
-                  response = "Available commands: help, led_on, led_off\r\n";
-              } else if (strcmp(line_buffer, "led_on") == 0) {
-                  pinMode(LED_BUILTIN, OUTPUT);
-                  digitalWrite(LED_BUILTIN, HIGH);
-                  response = "LED turned ON\r\n";
-              } else if (strcmp(line_buffer, "led_off") == 0) {
-                  pinMode(LED_BUILTIN, OUTPUT);
-                  digitalWrite(LED_BUILTIN, LOW);
-                  response = "LED turned OFF\r\n";
-              } // Add more else if for other commands...
-
-              // Send response back to SSH client
-              ssh_channel_write(chan, response, strlen(response));
-
-              // Send prompt for next command
-              ssh_channel_write(chan, "> ", 2);
-
-              line_pos = 0; // Reset buffer position for next command
-            } else if (line_pos < sizeof(line_buffer) - 1) {
-                // Add character to buffer
-                line_buffer[line_pos++] = buf[j];
-                // Echo character back
-                ssh_channel_write(chan, &buf[j], 1);
-            }
-          }
-        } else if (i < 0) { // Handle read errors
-            printf("Error reading channel: %s\n", ssh_get_error(session));
-            break; // Exit loop on error
-        }
-        // Add a small delay to prevent busy-waiting if no data is read
-        // This might be needed depending on how ssh_channel_read behaves (blocking/non-blocking)
-        // if (i == 0) {
-        //    vTaskDelay(10 / portTICK_PERIOD_MS);
-        // }
-
-    } while (i >= 0); // Loop while connection is open and no errors (i=0 means no data, i>0 means data, i<0 means error)
-
-    // Cleanup code follows...
-    ssh_channel_send_eof(chan); // Send End-of-File before closing
-    ssh_channel_close(chan);
-    ssh_disconnect(session);
-    ssh_bind_free(sshbind);
-#ifdef WITH_PCAP
-    cleanup_pcap();
-#endif
-    ssh_finalize();
-    return 0;
-}
-// EXAMPLE main FINISH
+WifiManager wifiManager;
+SshServer sshServer("/spiffs/.ssh/id_ed25519");
 
 #define newDevState(s) (devState = s)
 
@@ -561,7 +120,7 @@ void event_cb(void *args, esp_event_base_t base, int32_t id, void* event_data)
         Serial.println("% WiFi disconnected");
         wifiPhyConnected = false;
       }
-      WiFi.begin(configSTASSID, configSTAPSK);
+      wifiManager.connect(configSTASSID, configSTAPSK);
       break;
     case IP_EVENT_GOT_IP6:
       {
@@ -630,7 +189,7 @@ void controlTask(void *pvParameter)
   WiFi.disconnect(true);
   WiFi.mode(WIFI_MODE_STA);
   gotIpAddr = false; gotIp6Addr = false;
-  WiFi.begin(configSTASSID, configSTAPSK);
+  wifiManager.connect(configSTASSID, configSTAPSK);
 
   TickType_t xStartTime;
   xStartTime = xTaskGetTickCount();
@@ -678,23 +237,11 @@ void controlTask(void *pvParameter)
         break;
       case STATE_OTA_COMPLETE :
         aborting = false;
-        // Initialize the Arduino library.
-        libssh_begin();
-
-        // Call the EXAMPLE main code.
-        {
-          const char *ex_argv[] = { EX_CMD, NULL };
-          int ex_argc = sizeof ex_argv/sizeof ex_argv[0] - 1;
-          printf("%% Execution in progress:");
-          short a; for (a = 0; a < ex_argc; a++) printf(" %s", ex_argv[a]);
-          long start_millis = millis();
-          printf("\n[SNIP STDOUT START]\n");
-          int ex_rc = ex_main(ex_argc, (char**)ex_argv);
-          printf("[SNIP STDOUT FINISH]\n");
-          printf("%% Execution completed: rc=%d, elapsed=%ldms\n",
-            ex_rc, (long)millis() - start_millis);
+        sshServer.begin();
+        while (1) {
+            sshServer.handleClient();
+            vTaskDelay(10 / portTICK_PERIOD_MS);
         }
-        while (1) vTaskDelay(60000 / portTICK_PERIOD_MS);
         // Finished the EXAMPLE main code.
         if (!aborting)
           newDevState(STATE_LISTENING);
