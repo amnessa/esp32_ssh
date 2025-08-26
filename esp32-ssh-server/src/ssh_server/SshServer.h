@@ -1,7 +1,8 @@
 #ifndef SSH_SERVER_H
 #define SSH_SERVER_H
 
-#include <libssh.h>
+#include "libssh_esp32.h"
+#include <libssh/server.h>
 
 class SshServer {
 public:

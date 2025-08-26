@@ -2,8 +2,8 @@
 #include "ssh_server/SshServer.h"
 
 // Set local WiFi credentials below.
-const char *configSTASSID = "YOUR_SSID";
-const char *configSTAPSK = "YOUR_PASSWORD";
+const char *configSTASSID = "SUPERONLINE_Wi-Fi_A662";
+const char *configSTAPSK = "FReSBNCQy4";
 
 // The command line you would use to run this from a shell prompt.
 #define EX_CMD "samplesshd-kbdint", "--hostkey", "/spiffs/.ssh/id_ed25519", \
