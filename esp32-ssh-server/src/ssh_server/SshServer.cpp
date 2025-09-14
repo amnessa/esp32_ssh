@@ -4,6 +4,51 @@
 #include <libssh/server.h>
 // No SPIFFS/host-key storage; ephemeral in-memory host key
 
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2
+#endif
+
+static void ssh_write_str(ssh_channel ch, const char* s){
+    if (!ch) return;
+    if (s && *s) ssh_channel_write(ch, s, strlen(s));
+}
+
+static void ssh_write_line(ssh_channel ch, const char* s){
+    if (s) ssh_channel_write(ch, s, strlen(s));
+    ssh_channel_write(ch, "\r\n", 2);
+}
+
+static int ssh_read_nonblocking(ssh_channel ch, uint8_t* buf, int maxlen){
+    if (!ssh_channel_is_open(ch) || ssh_channel_is_eof(ch)) return -1;
+    int avail = ssh_channel_poll(ch, 0);
+    if (avail <= 0) return 0;
+    if (avail > maxlen) avail = maxlen;
+    int r = ssh_channel_read_nonblocking(ch, buf, avail, 0);
+    return r > 0 ? r : 0;
+}
+
+// Read lines without blocking; returns true when a full line is available in outLine
+static bool ssh_read_line(ssh_channel ch, String &inBuf, String &outLine){
+    uint8_t tmp[64];
+    int r = ssh_read_nonblocking(ch, tmp, sizeof(tmp));
+    if (r <= 0) return false;
+    for (int i=0;i<r;i++){
+        char c = (char)tmp[i];
+        if (c == '\r') continue; // normalize CRLF
+        if (c == '\n'){
+            outLine = inBuf;
+            inBuf = "";
+            return true;
+        }
+        if (c == 0x7f || c == 0x08){ // backspace
+            if (inBuf.length() > 0){ inBuf.remove(inBuf.length()-1); }
+            continue;
+        }
+        if (inBuf.length() < 256) inBuf += c;
+    }
+    return false;
+}
+
 SshServer::SshServer(const char* host_key) : host_key(host_key) {
     ssh_init();
 }
@@ -178,18 +223,106 @@ void SshServer::handleClient() {
         ssh_message_free(m);
     }
 
-    // Echo loop
-    char buf[256];
-    while (ssh_channel_is_open(ch) && !ssh_channel_is_eof(ch)) {
-        int r = ssh_channel_read(ch, buf, sizeof(buf), 0);
-        if (r > 0) {
-            ssh_channel_write(ch, buf, r);
-        } else if (r == SSH_ERROR) {
-            Serial.println("Channel read error");
-            break;
+    // Interactive app menu
+    auto runEchoMode = [&](ssh_channel ch){
+        ssh_write_line(ch, "Echo mode: type text and press Enter. Press 'q' then Enter to return to menu.");
+        ssh_write_str(ch, "> ");
+        String buf; String line;
+        while (ssh_channel_is_open(ch) && !ssh_channel_is_eof(ch)){
+            if (ssh_read_line(ch, buf, line)){
+                if (line == "q"){
+                    ssh_write_line(ch, "(leaving echo mode)");
+                    return;
+                }
+                ssh_write_line(ch, line.c_str());
+                ssh_write_str(ch, "> ");
+            }
+            delay(10);
         }
-        delay(1);
-    }
+    };
+
+    auto runBlinkApp = [&](ssh_channel ch){
+        pinMode(LED_BUILTIN, OUTPUT);
+        bool ledOn = false;
+        float freq = 2.0f; // Hz
+        const float minF = 0.1f, maxF = 20.0f;
+        unsigned long lastToggle = millis();
+        unsigned long halfPeriodMs = (unsigned long)(500.0f / freq);
+        auto recompute = [&](){ halfPeriodMs = (unsigned long)(500.0f / freq); if (halfPeriodMs < 1) halfPeriodMs = 1; };
+        ssh_write_line(ch, "Blinking LED app: default 2.0 Hz.");
+        ssh_write_line(ch, "Commands: '+' faster, '-' slower, a number sets Hz (e.g. 5), 'q' to return.");
+        ssh_write_str(ch, "> ");
+        String buf; String line;
+        while (ssh_channel_is_open(ch) && !ssh_channel_is_eof(ch)){
+            // Toggle LED
+            unsigned long now = millis();
+            if (now - lastToggle >= halfPeriodMs){
+                ledOn = !ledOn;
+                digitalWrite(LED_BUILTIN, ledOn ? HIGH : LOW);
+                lastToggle = now;
+            }
+            // Input processing
+            if (ssh_read_line(ch, buf, line)){
+                if (line == "q"){
+                    ssh_write_line(ch, "(stopping blink, returning to menu)");
+                    digitalWrite(LED_BUILTIN, LOW);
+                    return;
+                }
+                if (line == "+") { freq += 0.5f; if (freq > maxF) freq = maxF; recompute(); }
+                else if (line == "-") { freq -= 0.5f; if (freq < minF) freq = minF; recompute(); }
+                else {
+                    char *end=nullptr; double v = strtod(line.c_str(), &end);
+                    if (end && *end == '\0') { freq = (float)v; if (freq < minF) freq = minF; if (freq > maxF) freq = maxF; recompute(); }
+                }
+                char msg[48]; snprintf(msg, sizeof(msg), "freq = %.2f Hz", (double)freq);
+                ssh_write_line(ch, msg);
+                ssh_write_str(ch, "> ");
+            }
+            delay(5);
+        }
+        digitalWrite(LED_BUILTIN, LOW);
+    };
+
+    auto runMenu = [&](ssh_channel ch){
+        ssh_write_line(ch, "=== ESP32 Apps ===");
+        ssh_write_line(ch, "1) echo_mode");
+        ssh_write_line(ch, "2) blinking_led");
+        ssh_write_line(ch, "Type number and Enter to run, or 'quit' to disconnect.");
+        ssh_write_str(ch, "> ");
+        String buf; String line;
+        while (ssh_channel_is_open(ch) && !ssh_channel_is_eof(ch)){
+            if (ssh_read_line(ch, buf, line)){
+                if (line == "quit"){
+                    ssh_write_line(ch, "Goodbye.");
+                    return false; // close session
+                }
+                if (line == "1"){
+                    runEchoMode(ch);
+                    // show menu again after return
+                    ssh_write_line(ch, "=== ESP32 Apps ===");
+                    ssh_write_line(ch, "1) echo_mode");
+                    ssh_write_line(ch, "2) blinking_led");
+                    ssh_write_line(ch, "Type number and Enter to run, or 'quit' to disconnect.");
+                    ssh_write_str(ch, "> ");
+                } else if (line == "2"){
+                    runBlinkApp(ch);
+                    ssh_write_line(ch, "=== ESP32 Apps ===");
+                    ssh_write_line(ch, "1) echo_mode");
+                    ssh_write_line(ch, "2) blinking_led");
+                    ssh_write_line(ch, "Type number and Enter to run, or 'quit' to disconnect.");
+                    ssh_write_str(ch, "> ");
+                } else {
+                    ssh_write_line(ch, "Unknown option. Choose 1, 2 or 'quit'.");
+                    ssh_write_str(ch, "> ");
+                }
+            }
+            delay(10);
+        }
+        return false;
+    };
+
+    // Run the menu; closing returns to caller and ends session
+    (void)runMenu(ch);
 
     if (ch) ssh_channel_free(ch);
     ssh_disconnect(sess);
