@@ -3,6 +3,7 @@
 #include <libssh/libssh.h>
 #include <libssh/server.h>
 // No SPIFFS/host-key storage; ephemeral in-memory host key
+#include <string.h>
 
 #ifndef LED_BUILTIN
 #define LED_BUILTIN 2
@@ -28,23 +29,38 @@ static int ssh_read_nonblocking(ssh_channel ch, uint8_t* buf, int maxlen){
 }
 
 // Read lines without blocking; returns true when a full line is available in outLine
-static bool ssh_read_line(ssh_channel ch, String &inBuf, String &outLine){
+static bool ssh_read_line(ssh_channel ch, String &inBuf, String &outLine, bool echoKeys){
+    static bool eatLeadingLF = false; // swallow LF immediately after CR
     uint8_t tmp[64];
     int r = ssh_read_nonblocking(ch, tmp, sizeof(tmp));
     if (r <= 0) return false;
-    for (int i=0;i<r;i++){
+    int i = 0;
+    if (eatLeadingLF){
+        while (i < r && tmp[i] == '\n') i++;
+        eatLeadingLF = false;
+    }
+    for (; i<r; i++){
         char c = (char)tmp[i];
-        if (c == '\r') continue; // normalize CRLF
-        if (c == '\n'){
+        if (c == '\r' || c == '\n'){
+            if (c == '\r') eatLeadingLF = true;
             outLine = inBuf;
             inBuf = "";
+            if (echoKeys) ssh_channel_write(ch, "\r\n", 2);
             return true;
         }
         if (c == 0x7f || c == 0x08){ // backspace
-            if (inBuf.length() > 0){ inBuf.remove(inBuf.length()-1); }
+            if (inBuf.length() > 0){
+                inBuf.remove(inBuf.length()-1);
+                if (echoKeys) ssh_channel_write(ch, "\b \b", 3);
+            }
             continue;
         }
-        if (inBuf.length() < 256) inBuf += c;
+        if ((unsigned char)c >= 32 && (unsigned char)c < 127){
+            if (inBuf.length() < 256){
+                inBuf += c;
+                if (echoKeys) ssh_channel_write(ch, &c, 1);
+            }
+        }
     }
     return false;
 }
@@ -214,7 +230,7 @@ void SshServer::handleClient() {
             if (subtype == SSH_CHANNEL_REQUEST_SHELL) {
                 ssh_message_channel_request_reply_success(m);
                 ssh_message_free(m);
-                Serial.println("Shell started (echo mode)");
+                Serial.println("Shell ready");
                 shellReady = true;
                 break;
             }
@@ -229,7 +245,7 @@ void SshServer::handleClient() {
         ssh_write_str(ch, "> ");
         String buf; String line;
         while (ssh_channel_is_open(ch) && !ssh_channel_is_eof(ch)){
-            if (ssh_read_line(ch, buf, line)){
+            if (ssh_read_line(ch, buf, line, true)){
                 if (line == "q"){
                     ssh_write_line(ch, "(leaving echo mode)");
                     return;
@@ -252,7 +268,7 @@ void SshServer::handleClient() {
         ssh_write_line(ch, "Blinking LED app: default 2.0 Hz.");
         ssh_write_line(ch, "Commands: '+' faster, '-' slower, a number sets Hz (e.g. 5), 'q' to return.");
         ssh_write_str(ch, "> ");
-        String buf; String line;
+    String buf; String line;
         while (ssh_channel_is_open(ch) && !ssh_channel_is_eof(ch)){
             // Toggle LED
             unsigned long now = millis();
@@ -262,7 +278,7 @@ void SshServer::handleClient() {
                 lastToggle = now;
             }
             // Input processing
-            if (ssh_read_line(ch, buf, line)){
+            if (ssh_read_line(ch, buf, line, true)){
                 if (line == "q"){
                     ssh_write_line(ch, "(stopping blink, returning to menu)");
                     digitalWrite(LED_BUILTIN, LOW);
@@ -291,7 +307,7 @@ void SshServer::handleClient() {
         ssh_write_str(ch, "> ");
         String buf; String line;
         while (ssh_channel_is_open(ch) && !ssh_channel_is_eof(ch)){
-            if (ssh_read_line(ch, buf, line)){
+            if (ssh_read_line(ch, buf, line, true)){
                 if (line == "quit"){
                     ssh_write_line(ch, "Goodbye.");
                     return false; // close session
