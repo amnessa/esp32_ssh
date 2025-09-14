@@ -1,7 +1,4 @@
 #include "wifi_manager/WifiManager.h"
-#include "ssh_server/SshServer.h"
-
-SshServer sshServer("/id_ed25519");
 
 // Set local WiFi credentials below.
 const char *configSTASSID = "SUPERONLINE_Wi-Fi_A662";
@@ -10,9 +7,6 @@ const char *configSTAPSK = "FReSBNCQy4";
 // The command line you would use to run this from a shell prompt.
 //#define EX_CMD "samplesshd-kbdint", "--hostkey", "/spiffs/.ssh/id_ed25519", \
                "::"
-
-// SSH key storage location.
-#define KEYS_FOLDER "/spiffs/"
 
 // Stack size needed to run SSH.
 const unsigned int configSTACK = 10240;
@@ -28,50 +22,8 @@ const unsigned int configSTACK = 10240;
 #include <arpa/inet.h>
 #include "esp_netif.h"
 
-// Use argument parsing.
-// #define HAVE_ARGP_H // Keep this commented out or remove
-
-// EXAMPLE includes/defines START
-#include "libssh_esp32_config.h"
-
-// Undefine HAVE_ARGP_H as argp is not typically available/needed on ESP32
-#ifdef HAVE_ARGP_H
-#undef HAVE_ARGP_H
-#endif
-
-#include <libssh/libssh.h>
-#include <libssh/server.h>
-
-#ifdef HAVE_ARGP_H // This preprocessor block will now be false
-#include "argp.h"
-#endif
-#include <stdlib.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdbool.h>
-
-#ifndef BUF_SIZE
-#define BUF_SIZE 2048
-#endif
-
-#define SSHD_USER "cagopa"
-#define SSHD_PASSWORD "cago123123"
-
-#ifndef KEYS_FOLDER
-#ifdef _WIN32
-#define KEYS_FOLDER
-#else
-#define KEYS_FOLDER "/etc/ssh/"
-#endif
-#endif
-
-static int port = 2222;
-static bool authenticated = false;
-// EXAMPLE includes/defines FINISH
-
-#include <sys/reent.h>
-struct _reent reent_data_esp32;
-struct _reent *_impure_ptr = &reent_data_esp32;
+// Use LibSSH-ESP32 helper API for password-only server
+#include <libssh_esp32.h>
 
 volatile bool wifiPhyConnected;
 
@@ -102,6 +54,11 @@ WifiManager wifiManager;
 #include <WiFi.h>
 WiFiServer diagServer(8080);
 static TaskHandle_t diagTaskHandle = nullptr;
+
+// NEW: SSH password-only server task
+static TaskHandle_t sshTaskHandle = nullptr;
+static const char* sshUser = "esp32";
+static const char* sshPass = "qwe123asd";
 
 void diagServerTask(void *param) {
   for (;;) {
@@ -169,6 +126,32 @@ void event_cb(void *args, esp_event_base_t base, int32_t id, void* event_data)
           diagServer.begin();
           xTaskCreatePinnedToCore(diagServerTask, "diag", 4096, nullptr, 1, &diagTaskHandle, 0);
           Serial.println("% Diagnostic TCP server listening on port 8080");
+        }
+
+        // Start SSH server once (password-only)
+        if (!sshTaskHandle) {
+          auto sshServerTask = [](void*){
+            if (!libssh_begin()) {
+              Serial.println("[SSH] init failed");
+              vTaskDelete(nullptr);
+              return;
+            }
+            ssh_server_set_auth_password(sshUser, sshPass);
+            ssh_server_begin();
+            Serial.println("[SSH] Server started (password auth, default port 22)");
+            for (;;) {
+              if (ssh_server_has_client_command()) {
+                String cmd = ssh_server_get_client_command();
+                Serial.print("[SSH] cmd: ");
+                Serial.println(cmd);
+                // Echo back
+                ssh_server_write_client(cmd.c_str());
+                ssh_server_write_client("\n");
+              }
+              vTaskDelay(10 / portTICK_PERIOD_MS);
+            }
+          };
+          xTaskCreatePinnedToCore(sshServerTask, "ssh", 8192, nullptr, 2, &sshTaskHandle, 0);
         }
       }
       break;
@@ -258,20 +241,13 @@ void controlTask(void *pvParameter)
         newDevState(STATE_OTA_COMPLETE);
         break;
       case STATE_OTA_COMPLETE :
-        aborting = false;
-        sshServer.begin();
-        while (1) {
-            sshServer.handleClient();
-        }
-        // Finished the EXAMPLE main code.
-        if (!aborting)
-          newDevState(STATE_LISTENING);
-        else
-          newDevState(STATE_TCP_DISCONNECTED);
+        // No longer block here running sshServer.begin()/handleClient()
+        // SSH starts from event_cb when IP is ready
+        newDevState(STATE_LISTENING);
         break;
       case STATE_LISTENING :
-        aborting = false;
-        newDevState(STATE_TCP_DISCONNECTED);
+        // Idle state; nothing to do
+        vTaskDelay(NET_WAIT_MS / portTICK_PERIOD_MS);
         break;
       case STATE_TCP_DISCONNECTED :
         // This would be the place to free net resources, if needed,
@@ -281,15 +257,6 @@ void controlTask(void *pvParameter)
         break;
     }
   }
-}
-
-void sshServerTask(void *param) {
-    sshServer.begin();
-    for (;;) {
-        sshServer.handleClient();
-        // Short yield
-        delay(10);
-    }
 }
 
 void setup()
