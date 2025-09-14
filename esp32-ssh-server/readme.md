@@ -1,4 +1,7 @@
-Of course. Here's how you can create an SSH server on an ESP32 using the `LibSSH-ESP32` library, including the option for password authentication.
+heck port 8080: nc -vz 192.168.1.7 8080
+Then SSH on 22: ssh -vvv -o StrictHostKeyChecking=no -p 22 cago@192.168.1.7
+
+user cago1231
 
 ### **Core Concepts**
 

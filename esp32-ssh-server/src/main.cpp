@@ -1,12 +1,11 @@
 #include "wifi_manager/WifiManager.h"
+#include "ssh_server/SshServer.h"
 
 // Set local WiFi credentials below.
 const char *configSTASSID = "SUPERONLINE_Wi-Fi_A662";
 const char *configSTAPSK = "FReSBNCQy4";
 
-// The command line you would use to run this from a shell prompt.
-//#define EX_CMD "samplesshd-kbdint", "--hostkey", "/spiffs/.ssh/id_ed25519", \
-               "::"
+// Removed leftover EX_CMD sample from original project
 
 // Stack size needed to run SSH.
 const unsigned int configSTACK = 10240;
@@ -22,8 +21,7 @@ const unsigned int configSTACK = 10240;
 #include <arpa/inet.h>
 #include "esp_netif.h"
 
-// Use LibSSH-ESP32 helper API for password-only server
-#include <libssh_esp32.h>
+// We use our own minimal SshServer wrapper (no filesystem keys)
 
 volatile bool wifiPhyConnected;
 
@@ -47,7 +45,7 @@ typedef enum
 static volatile devState_t devState;
 static volatile bool gotIpAddr, gotIp6Addr;
 
-#include "SPIFFS.h"
+// No SPIFFS needed for SSH
 
 WifiManager wifiManager;
 // Diagnostic plain TCP server to verify inbound connectivity independent of libssh
@@ -55,10 +53,9 @@ WifiManager wifiManager;
 WiFiServer diagServer(8080);
 static TaskHandle_t diagTaskHandle = nullptr;
 
-// NEW: SSH password-only server task
+// NEW: SSH server task
 static TaskHandle_t sshTaskHandle = nullptr;
-static const char* sshUser = "esp32";
-static const char* sshPass = "qwe123asd";
+static SshServer sshServer("/id_ed25519");
 
 void diagServerTask(void *param) {
   for (;;) {
@@ -128,30 +125,16 @@ void event_cb(void *args, esp_event_base_t base, int32_t id, void* event_data)
           Serial.println("% Diagnostic TCP server listening on port 8080");
         }
 
-        // Start SSH server once (password-only)
+        // Start SSH server once
         if (!sshTaskHandle) {
-          auto sshServerTask = [](void*){
-            if (!libssh_begin()) {
-              Serial.println("[SSH] init failed");
-              vTaskDelete(nullptr);
-              return;
-            }
-            ssh_server_set_auth_password(sshUser, sshPass);
-            ssh_server_begin();
-            Serial.println("[SSH] Server started (password auth, default port 22)");
-            for (;;) {
-              if (ssh_server_has_client_command()) {
-                String cmd = ssh_server_get_client_command();
-                Serial.print("[SSH] cmd: ");
-                Serial.println(cmd);
-                // Echo back
-                ssh_server_write_client(cmd.c_str());
-                ssh_server_write_client("\n");
-              }
-              vTaskDelay(10 / portTICK_PERIOD_MS);
+          auto sshTask = [](void*){
+            sshServer.begin();
+            for(;;){
+              sshServer.handleClient();
+              vTaskDelay(1);
             }
           };
-          xTaskCreatePinnedToCore(sshServerTask, "ssh", 8192, nullptr, 2, &sshTaskHandle, 0);
+          xTaskCreatePinnedToCore(sshTask, "ssh", 12288, nullptr, 2, &sshTaskHandle, 0);
         }
       }
       break;
@@ -164,31 +147,9 @@ void event_cb(void *args, esp_event_base_t base, int32_t id, void* event_data)
 
 void controlTask(void *pvParameter)
 {
-  _REENT_INIT_PTR((&reent_data_esp32));
+  // Removed newlib reent init from example
 
-  // Mount the file system.
-  boolean fsGood = SPIFFS.begin();
-  if (!fsGood)
-  {
-    printf("%% No formatted SPIFFS filesystem found to mount.\n");
-    printf("%% Format SPIFFS and mount now (NB. may cause data loss) [y/n]?\n");
-    while (!Serial.available()) {} // Waits here for input.
-    char c = Serial.read();
-    if (c == 'y' || c == 'Y')
-    {
-      printf("%% Formatting...\n");
-      fsGood = SPIFFS.format();
-      if (fsGood) SPIFFS.begin();
-    }
-  }
-  if (!fsGood)
-  {
-    printf("%% Aborting now.\n");
-    while (1) vTaskDelay(60000 / portTICK_PERIOD_MS);
-  }
-  printf(
-    "%% Mounted SPIFFS used=%d total=%d\r\n", SPIFFS.usedBytes(),
-    SPIFFS.totalBytes());
+  // No SPIFFS required for SSH anymore
 
   wifiPhyConnected = false;
   WiFi.disconnect(true);

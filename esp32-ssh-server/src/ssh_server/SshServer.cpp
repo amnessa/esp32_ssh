@@ -2,7 +2,7 @@
 #include <Arduino.h>
 #include <libssh/libssh.h>
 #include <libssh/server.h>
-#include "SPIFFS.h"
+// No SPIFFS/host-key storage; ephemeral in-memory host key
 
 SshServer::SshServer(const char* host_key) : host_key(host_key) {
     ssh_init();
@@ -11,29 +11,14 @@ SshServer::SshServer(const char* host_key) : host_key(host_key) {
 void SshServer::begin() {
     libssh_begin();
 
-    if (!SPIFFS.begin(false) && !SPIFFS.begin(true)) {
-        Serial.println("SPIFFS mount failed");
-        return;
-    }
-
-    // Flat path (SPIFFS: no true dirs)
-    const char *fallbackPath = "/id_ed25519";
-    const char *keyPath = (host_key && *host_key) ? host_key : fallbackPath;
-    Serial.printf("[SSH] Using host key path: %s\n", keyPath);
-
     sshbind = ssh_bind_new();
     if (!sshbind) {
         Serial.println("ssh_bind_new failed");
         return;
     }
 
-    // Test on higher port first to avoid any reserved/priv interactions then you can switch back to 22.
-    // Change this to 22 after confirming basic accept path works.
-    // Use higher port for initial diagnostic; change to 22 later
-#ifndef SSH_SERVER_PORT
-#define SSH_SERVER_PORT 2222
-#endif
-    const int port = SSH_SERVER_PORT;
+    // Bind to port 22 (standard SSH)
+    const int port = 22;
     const char *addr4 = "0.0.0.0";
     char portStr[6];
     snprintf(portStr, sizeof(portStr), "%d", port);
@@ -52,36 +37,16 @@ void SshServer::begin() {
     ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_BINDADDR6, addr6);
 #endif
 
-    bool loaded = false;
-    if (SPIFFS.exists(keyPath)) {
-        ssh_key fileKey = nullptr;
-        int rc = ssh_pki_import_privkey_file(keyPath, nullptr, nullptr, nullptr, &fileKey);
-        if (rc == SSH_OK && fileKey) {
-            if (ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_IMPORT_KEY, fileKey) == SSH_OK) {
-                Serial.printf("[SSH] Host key loaded: %s\n", keyPath);
-                loaded = true;
-            } else {
-                Serial.printf("[SSH] Import key option failed: %s\n", ssh_get_error(sshbind));
-                ssh_key_free(fileKey);
-            }
+    // Generate ephemeral ED25519 host key in memory (no filesystem)
+    ssh_key genKey = nullptr;
+    if (ssh_pki_generate(SSH_KEYTYPE_ED25519, 0, &genKey) == SSH_OK) {
+        if (ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_IMPORT_KEY, genKey) == SSH_OK) {
+            Serial.println("[SSH] Using ephemeral ED25519 host key");
         } else {
-            Serial.printf("[SSH] Import privkey failed rc=%d\n", rc);
+            Serial.printf("[SSH] Import generated key failed: %s\n", ssh_get_error(sshbind));
         }
-    }
-    if (!loaded) {
-        ssh_key genKey = nullptr;
-        if (ssh_pki_generate(SSH_KEYTYPE_ED25519, 0, &genKey) == SSH_OK) {
-            if (ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_IMPORT_KEY, genKey) == SSH_OK) {
-                Serial.println("[SSH] Generated ED25519 host key (ephemeral until saved)");
-                int rc = ssh_pki_export_privkey_file(genKey, nullptr, nullptr, nullptr, keyPath);
-                if (rc == SSH_OK) Serial.printf("[SSH] Saved host key %s\n", keyPath);
-                else Serial.printf("[SSH] Save host key failed rc=%d\n", rc);
-            } else {
-                Serial.printf("[SSH] Import generated key failed: %s\n", ssh_get_error(sshbind));
-            }
-        } else {
-            Serial.println("[SSH] Host key generation failed");
-        }
+    } else {
+        Serial.println("[SSH] Host key generation failed");
     }
 
     Serial.printf("[SSH] Calling ssh_bind_listen() on port %d...\n", port);
@@ -90,8 +55,7 @@ void SshServer::begin() {
         return;
     }
     Serial.printf("[SSH] Listening OK on port %d (0.0.0.0 / ::)\n", port);
-    Serial.println("[SSH] If client still gets 'connection refused', a raw TCP probe will be attempted next iteration.");
-    // TODO: Next step if still refused: spin up a WiFiServer on another port to ensure inbound connectivity
+    // No SPIFFS; no key saving
 }
 
 int SshServer::auth_password(ssh_session session, const char *user, const char *password, void *userdata) {
@@ -177,7 +141,7 @@ void SshServer::handleClient() {
         ssh_message_free(m);
     }
 
-    // Shell request
+    // PTY and Shell request
     bool shellReady = false;
     while (!shellReady) {
         ssh_message m = ssh_message_get(sess);
@@ -188,13 +152,27 @@ void SshServer::handleClient() {
             ssh_free(sess);
             return;
         }
-        if (ssh_message_type(m) == SSH_REQUEST_CHANNEL &&
-            ssh_message_subtype(m) == SSH_CHANNEL_REQUEST_SHELL) {
-            ssh_message_channel_request_reply_success(m);
-            ssh_message_free(m);
-            Serial.println("Shell started (echo mode)");
-            shellReady = true;
-            break;
+        if (ssh_message_type(m) == SSH_REQUEST_CHANNEL) {
+            int subtype = ssh_message_subtype(m);
+            if (subtype == SSH_CHANNEL_REQUEST_PTY) {
+                ssh_message_channel_request_reply_success(m);
+                ssh_message_free(m);
+                Serial.println("PTY allocated");
+                continue; // wait for shell/exec
+            }
+            if (subtype == SSH_CHANNEL_REQUEST_ENV) {
+                // Accept env to keep clients happy (ignored)
+                ssh_message_channel_request_reply_success(m);
+                ssh_message_free(m);
+                continue;
+            }
+            if (subtype == SSH_CHANNEL_REQUEST_SHELL) {
+                ssh_message_channel_request_reply_success(m);
+                ssh_message_free(m);
+                Serial.println("Shell started (echo mode)");
+                shellReady = true;
+                break;
+            }
         }
         ssh_message_reply_default(m);
         ssh_message_free(m);
