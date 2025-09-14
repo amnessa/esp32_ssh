@@ -1,6 +1,8 @@
 #include "wifi_manager/WifiManager.h"
 #include "ssh_server/SshServer.h"
 
+SshServer sshServer("/id_ed25519");
+
 // Set local WiFi credentials below.
 const char *configSTASSID = "SUPERONLINE_Wi-Fi_A662";
 const char *configSTAPSK = "FReSBNCQy4";
@@ -63,7 +65,7 @@ const unsigned int configSTACK = 10240;
 #endif
 #endif
 
-static int port = 22;
+static int port = 2222;
 static bool authenticated = false;
 // EXAMPLE includes/defines FINISH
 
@@ -96,7 +98,21 @@ static volatile bool gotIpAddr, gotIp6Addr;
 #include "SPIFFS.h"
 
 WifiManager wifiManager;
-SshServer sshServer("/spiffs/.ssh/id_ed25519");
+// Diagnostic plain TCP server to verify inbound connectivity independent of libssh
+#include <WiFi.h>
+WiFiServer diagServer(8080);
+static TaskHandle_t diagTaskHandle = nullptr;
+
+void diagServerTask(void *param) {
+  for (;;) {
+    WiFiClient c = diagServer.available();
+    if (c) {
+      c.println("ESP32 TCP diag OK (port 8080)\r");
+      c.stop();
+    }
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+  }
+}
 
 #define newDevState(s) (devState = s)
 
@@ -148,6 +164,12 @@ void event_cb(void *args, esp_event_base_t base, int32_t id, void* event_data)
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         Serial.print("% IPv4 Address: ");
         Serial.println(IPAddress(event->ip_info.ip.addr));
+        // Start diagnostic server once
+        if (!diagTaskHandle) {
+          diagServer.begin();
+          xTaskCreatePinnedToCore(diagServerTask, "diag", 4096, nullptr, 1, &diagTaskHandle, 0);
+          Serial.println("% Diagnostic TCP server listening on port 8080");
+        }
       }
       break;
     case IP_EVENT_STA_LOST_IP:
@@ -259,6 +281,15 @@ void controlTask(void *pvParameter)
         break;
     }
   }
+}
+
+void sshServerTask(void *param) {
+    sshServer.begin();
+    for (;;) {
+        sshServer.handleClient();
+        // Short yield
+        delay(10);
+    }
 }
 
 void setup()
